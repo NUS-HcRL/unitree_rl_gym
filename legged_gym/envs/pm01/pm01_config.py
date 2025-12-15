@@ -37,7 +37,7 @@ class Pm01FallCfg(LeggedRobotCfg):
         num_privileged_obs = 82  # Same as observations for now
         num_actions = 22  # 22 controllable joints (excluding j12_waist_yaw and j23_head_yaw)
         env_spacing = 1.5
-        episode_length_s = 5
+        episode_length_s = 25
         send_timeouts = True
 
     class terrain(LeggedRobotCfg.terrain):
@@ -98,7 +98,7 @@ class Pm01FallCfg(LeggedRobotCfg):
             "link_elbow_end_r"
         ]
         self_collisions = 0
-        collapse_fixed_joints = True
+        collapse_fixed_joints = False  # Set to False to keep elbow_end and elbow_yaw separate
         flip_visual_attachments = False
         replace_cylinder_with_capsule = False
 

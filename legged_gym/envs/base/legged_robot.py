@@ -156,9 +156,21 @@ class LeggedRobot(BaseTask):
             self.episode_sums[key][env_ids] = 0.
         if self.cfg.commands.curriculum:
             self.extras["episode"]["max_command_x"] = self.command_ranges["lin_vel_x"][1]
-        # send timeout info to the algorithm
+        
+        # Add termination statistics
         if self.cfg.env.send_timeouts:
             self.extras["time_outs"] = self.time_out_buf
+            # Calculate termination statistics for reset environments
+            time_out_count = torch.sum(self.time_out_buf[env_ids]).item()
+            termination_count = len(env_ids) - time_out_count
+            self.extras["episode"]["termination_rate"] = termination_count / len(env_ids) if len(env_ids) > 0 else 0.0
+            self.extras["episode"]["timeout_rate"] = time_out_count / len(env_ids) if len(env_ids) > 0 else 0.0
+            # Store termination info for each reset environment
+            self.extras["episode"]["termination_info"] = {
+                "timeout": time_out_count,
+                "termination": termination_count,
+                "total": len(env_ids)
+            }
     
     def compute_reward(self):
         """ Compute rewards

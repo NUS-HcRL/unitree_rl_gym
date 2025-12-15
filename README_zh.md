@@ -170,8 +170,7 @@ wandb login
 1205492990-nus
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:~/anaconda3/envs/engineai_rl_ws/lib
 python legged_gym/scripts/train.py --task=pm01_fall --num_env 2048 --headless --logger wandb
-python legged_gym/scripts/play.py --task=pm01_fall --num_env 100 --load_run 2025-12-08_18-36-54
-python engineai_rl_workspace/scripts/train.py --exp_name pm01_fall_ppo --headless --resume --load_run 2025-12-08_17-36-54
+python legged_gym/scripts/play.py --task=pm01_fall --num_env 100 --load_run Dec16_02-44-25_
 
 # 需要 protocol 版本一致  pip install protobuf==3.20.3
 tensorboard --logdir=logs/pm01_fall_ppo/default/2025-12-06_23-48-29

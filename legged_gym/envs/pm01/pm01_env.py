@@ -207,11 +207,17 @@ class Pm01Robot(LeggedRobot):
     
     def check_termination(self):
         """Check if environments need to be reset"""
-        # Start with base termination check
-        self.reset_buf = torch.any(torch.norm(self.contact_forces[:, self.termination_contact_indices, :], dim=-1) > 1., dim=1)
+        # Check contact force termination using configured threshold
+        if hasattr(self, 'termination_contact_indices') and self.termination_contact_indices.numel() > 0:
+            termination_threshold = getattr(self.cfg.rewards, 'termination_contact_threshold', 40000.0)
+            self.reset_buf = torch.any(
+                torch.norm(self.contact_forces[:, self.termination_contact_indices, :], dim=-1) > termination_threshold,
+                dim=1
+            )
+        else:
+            self.reset_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         
-        # Check orientation termination
-        self.reset_buf |= torch.logical_or(torch.abs(self.rpy[:,1])>1.0, torch.abs(self.rpy[:,0])>0.8)
+        # Orientation termination removed - only contact force and timeout will terminate
         
         # Check timeout
         self.time_out_buf = self.episode_length_buf > self.max_episode_length
