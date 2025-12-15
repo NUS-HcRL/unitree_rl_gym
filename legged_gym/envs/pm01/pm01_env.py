@@ -283,19 +283,25 @@ class Pm01Robot(LeggedRobot):
         shoulder_hit = _hit(self.shoulder_yaw_indices)
         elbow_hit = _hit(self.elbow_pitch_indices)
         
-        # Check knee/hip flexion
+        # Check knee/hip flexion (relative to default angles)
         p = 0.0  # Training progress (simplified for now)
-        knee_flex_threshold = 1.3 * min(1.0, p / 0.2)
+        knee_flex_threshold = 1.3 * min(1.0, p / 0.2)  # Additional flexion beyond default
         knee_flex_ok = True
         if len(self.knee_dof_indices) > 0:
             knee_angles = self.dof_pos[:, self.knee_dof_indices]
-            knee_flex_ok = (knee_angles > knee_flex_threshold).any(dim=1)
+            # Get default knee angles for the corresponding DOFs
+            default_knee_angles = self.default_dof_pos[0, self.knee_dof_indices]  # (num_knee_dofs,)
+            # Check if flexion relative to default exceeds threshold
+            knee_flex_ok = ((knee_angles - default_knee_angles.unsqueeze(0)) > knee_flex_threshold).any(dim=1)
         
-        hip_flex_threshold = -1.0 * min(1.0, p / 0.2)
+        hip_flex_threshold = -1.0 * min(1.0, p / 0.2)  # Additional flexion beyond default (negative for hip)
         hip_flex_ok = True
         if len(self.hip_pitch_dof_indices) > 0:
             hip_angles = self.dof_pos[:, self.hip_pitch_dof_indices]
-            hip_flex_ok = (hip_angles < hip_flex_threshold).any(dim=1)
+            # Get default hip angles for the corresponding DOFs
+            default_hip_angles = self.default_dof_pos[0, self.hip_pitch_dof_indices]  # (num_hip_dofs,)
+            # Check if flexion relative to default exceeds threshold (hip flexion is negative)
+            hip_flex_ok = ((hip_angles - default_hip_angles.unsqueeze(0)) < hip_flex_threshold).any(dim=1)
         
         flex_ok = (knee_hit & knee_flex_ok) | (hip_pitch_hit & hip_flex_ok)
         
