@@ -37,7 +37,7 @@ class Pm01FallCfg(LeggedRobotCfg):
         num_privileged_obs = 82  # Same as observations for now
         num_actions = 22  # 22 controllable joints (excluding j12_waist_yaw and j23_head_yaw)
         env_spacing = 1.5
-        episode_length_s = 5
+        episode_length_s = 3
         send_timeouts = True
 
     class terrain(LeggedRobotCfg.terrain):
@@ -148,7 +148,7 @@ class Pm01FallCfg(LeggedRobotCfg):
             # Fall protection rewards
             root_lin_vel = -0.0
             critical_contacts = -0.0
-            all_contacts = -0.0
+            all_contacts = -1.0e-3
             actuation_impulse = -0.0
             dof_pos_limits = -0.0
             torque_saturation = -0.0

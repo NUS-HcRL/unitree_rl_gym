@@ -285,7 +285,7 @@ class Pm01Robot(LeggedRobot):
         
         # Check knee/hip flexion (relative to default angles)
         p = 0.0  # Training progress (simplified for now)
-        knee_flex_threshold = 1.3 * min(1.0, p / 0.2)  # Additional flexion beyond default
+        knee_flex_threshold = 1.3 * min(1.0, p / 0.05)  # Additional flexion beyond default
         knee_flex_ok = True
         if len(self.knee_dof_indices) > 0:
             knee_angles = self.dof_pos[:, self.knee_dof_indices]
@@ -294,7 +294,7 @@ class Pm01Robot(LeggedRobot):
             # Check if flexion relative to default exceeds threshold
             knee_flex_ok = ((knee_angles - default_knee_angles.unsqueeze(0)) > knee_flex_threshold).any(dim=1)
         
-        hip_flex_threshold = -1.0 * min(1.0, p / 0.2)  # Additional flexion beyond default (negative for hip)
+        hip_flex_threshold = -1.0 * min(1.0, p / 0.05)  # Additional flexion beyond default (negative for hip)
         hip_flex_ok = True
         if len(self.hip_pitch_dof_indices) > 0:
             hip_angles = self.dof_pos[:, self.hip_pitch_dof_indices]
