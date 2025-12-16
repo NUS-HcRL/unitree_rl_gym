@@ -137,6 +137,23 @@ class Pm01Robot(LeggedRobot):
         # Joint indices cache
         self._knee_dof_indices = None
         self._hip_pitch_dof_indices = None
+        
+        # Initialize curriculum learning parameters
+        if hasattr(self.cfg.domain_rand, 'curriculum') and hasattr(self.cfg.domain_rand.curriculum, 'max_curriculum_step'):
+            self._max_curriculum_step = self.cfg.domain_rand.curriculum.max_curriculum_step
+        else:
+            # Default: 15000 iterations * 4096 envs * 24 steps = 1,474,560,000 steps
+            max_iterations = 15000
+            num_steps_per_env = 24
+            self._max_curriculum_step = max_iterations * self.num_envs * num_steps_per_env
+        
+        # Initialize dof_name_to_idx for curriculum learning (lazy initialization)
+        self._dof_name_to_idx = None
+    
+    def compute_training_progress(self):
+        """Compute training progress, return value between 0.0 and 1.0"""
+        p = self.common_step_counter / self._max_curriculum_step
+        return torch.clamp(torch.tensor(p, device=self.device), 0.0, 1.0)
     
     def _init_fall_protection_indices(self):
         """Initialize body and dof indices for fall protection"""
@@ -200,10 +217,201 @@ class Pm01Robot(LeggedRobot):
     
     def reset_idx(self, env_ids):
         """Reset environments and contact state"""
-        super().reset_idx(env_ids)
+        # Apply curriculum learning to DOF positions before calling super().reset_idx()
+        if (hasattr(self.cfg.domain_rand, 'curriculum') and 
+            hasattr(self.cfg.domain_rand.curriculum, 'enable_curriculum') and
+            self.cfg.domain_rand.curriculum.enable_curriculum):
+            self._reset_dofs_with_curriculum(env_ids)
+        else:
+            # Use default reset
+            self._reset_dofs(env_ids)
+        
+        # Call parent reset_idx for other resets
+        # We need to manually call the parts we need since we already reset DOFs
+        if len(env_ids) == 0:
+            return
+        
+        self._reset_root_states(env_ids)
+        self._resample_commands(env_ids)
+        
+        # reset buffers
+        self.actions[env_ids] = 0.
+        self.last_actions[env_ids] = 0.
+        self.last_dof_vel[env_ids] = 0.
+        self.feet_air_time[env_ids] = 0.
+        self.episode_length_buf[env_ids] = 0
+        self.reset_buf[env_ids] = 1
+        
+        # Reset contact state
         self.contact_state[env_ids] = 0
         self.critical_contact_hit[env_ids] = False
         self.catastrophic_contact_hit[env_ids] = False
+        
+        # fill extras
+        self.extras["episode"] = {}
+        for key in self.episode_sums.keys():
+            self.extras["episode"]['rew_' + key] = torch.mean(self.episode_sums[key][env_ids]) / self.max_episode_length_s
+            self.episode_sums[key][env_ids] = 0.
+        if self.cfg.commands.curriculum:
+            self.extras["episode"]["max_command_x"] = self.command_ranges["lin_vel_x"][1]
+        
+        # Add termination statistics
+        if self.cfg.env.send_timeouts:
+            self.extras["time_outs"] = self.time_out_buf
+            # Calculate termination statistics for reset environments
+            time_out_count = torch.sum(self.time_out_buf[env_ids]).item()
+            termination_count = len(env_ids) - time_out_count
+            self.extras["episode"]["termination_rate"] = termination_count / len(env_ids) if len(env_ids) > 0 else 0.0
+            self.extras["episode"]["timeout_rate"] = time_out_count / len(env_ids) if len(env_ids) > 0 else 0.0
+            # Store termination info for each reset environment
+            self.extras["episode"]["termination_info"] = {
+                "timeout": time_out_count,
+                "termination": termination_count,
+                "total": len(env_ids)
+            }
+    
+    def _reset_dofs_with_curriculum(self, env_ids):
+        """Reset DOF positions with curriculum learning (joint position randomization)"""
+        if len(env_ids) == 0:
+            return
+        
+        # Ensure env_ids are within valid range
+        env_ids = env_ids[env_ids < self.num_envs]
+        if len(env_ids) == 0:
+            return
+        
+        # Ensure dof_name_to_idx is initialized
+        if self._dof_name_to_idx is None:
+            self._dof_name_to_idx = {}
+            for i, name in enumerate(self.dof_names):
+                self._dof_name_to_idx[name] = i
+        
+        p = self.compute_training_progress().item()  # Get scalar value
+        
+        # 1) Modify DoF initial positions: 0.8 ~ 1.2 * q0
+        if self.default_dof_pos.dim() == 2 and self.default_dof_pos.shape[0] == 1:
+            q0 = self.default_dof_pos[0].unsqueeze(0).expand(len(env_ids), -1)  # (n, dofs)
+        elif self.default_dof_pos.dim() == 1:
+            q0 = self.default_dof_pos.unsqueeze(0).expand(len(env_ids), -1)  # (n, dofs)
+        else:
+            q0 = self.default_dof_pos[env_ids]  # (n, dofs)
+        scale = torch.rand(len(env_ids), self.num_dof, device=self.device) * 0.4 + 0.8  # U(0.8, 1.2)
+        q_init = q0 * scale
+        
+        # 2) Additional randomization for waist/shoulder/elbow based on training progress p
+        # Find joint indices
+        idx_waist_pitch = None
+        idx_waist_roll = None
+        idx_waist_yaw = None
+        idx_sh_pitch_l = None
+        idx_sh_roll_l = None
+        idx_sh_pitch_r = None
+        idx_sh_roll_r = None
+        idx_elbow_l = None
+        idx_elbow_r = None
+        
+        # Find joint indices based on joint names (using dictionary like original code)
+        for name, idx in self._dof_name_to_idx.items():
+            name_lower = name.lower()
+            if "waist_pitch" in name_lower:
+                idx_waist_pitch = idx
+            elif "waist_roll" in name_lower:
+                idx_waist_roll = idx
+            elif "waist_yaw" in name_lower or "j12" in name:
+                idx_waist_yaw = idx
+            elif "shoulder_pitch_l" in name_lower or "j13" in name:
+                idx_sh_pitch_l = idx
+            elif "shoulder_roll_l" in name_lower or "j14" in name:
+                idx_sh_roll_l = idx
+            elif "shoulder_pitch_r" in name_lower or "j18" in name:
+                idx_sh_pitch_r = idx
+            elif "shoulder_roll_r" in name_lower or "j19" in name:
+                idx_sh_roll_r = idx
+            elif "elbow_pitch_l" in name_lower or "j16" in name:
+                # elbow_pitch_l
+                if idx_elbow_l is None:
+                    idx_elbow_l = idx
+            elif "elbow_yaw_l" in name_lower or "j17" in name:
+                # elbow_yaw_l，如果还没有设置则使用这个
+                if idx_elbow_l is None:
+                    idx_elbow_l = idx
+            elif "elbow_pitch_r" in name_lower or "j21" in name:
+                # elbow_pitch_r
+                if idx_elbow_r is None:
+                    idx_elbow_r = idx
+            elif "elbow_yaw_r" in name_lower or "j22" in name:
+                # elbow_yaw_r，如果还没有设置则使用这个
+                if idx_elbow_r is None:
+                    idx_elbow_r = idx
+        
+        # Apply curriculum-based randomization for waist/shoulder/elbow (according to table 2)
+        # Ensure indices are within valid range
+        # waist_pitch: U(-0.5, 0.5)
+        if idx_waist_pitch is not None and 0 <= idx_waist_pitch < self.num_dof:
+            q_init[:, idx_waist_pitch] = torch.empty(len(env_ids), device=self.device).uniform_(-0.5, 0.5)
+        
+        # waist_roll: U(-0.5, 0.5)
+        if idx_waist_roll is not None and 0 <= idx_waist_roll < self.num_dof:
+            q_init[:, idx_waist_roll] = torch.empty(len(env_ids), device=self.device).uniform_(-0.5, 0.5)
+        
+        # waist_yaw: U(-(p+0.2), p+0.2)
+        if idx_waist_yaw is not None and 0 <= idx_waist_yaw < self.num_dof:
+            q_init[:, idx_waist_yaw] = torch.empty(len(env_ids), device=self.device).uniform_(-(p + 0.2), p + 0.2)
+        
+        # shoulder_pitch_l: U(-(p+0.4), p+0.4)
+        if idx_sh_pitch_l is not None and 0 <= idx_sh_pitch_l < self.num_dof:
+            q_init[:, idx_sh_pitch_l] = torch.empty(len(env_ids), device=self.device).uniform_(-(p + 0.4), p + 0.4)
+        
+        # shoulder_roll_l: U(0.15, 1.3*p + 0.15)
+        if idx_sh_roll_l is not None and 0 <= idx_sh_roll_l < self.num_dof:
+            q_init[:, idx_sh_roll_l] = torch.empty(len(env_ids), device=self.device).uniform_(0.15, 1.3 * p + 0.15)
+        
+        # shoulder_pitch_r: U(-(p+0.4), p+0.4)
+        if idx_sh_pitch_r is not None and 0 <= idx_sh_pitch_r < self.num_dof:
+            q_init[:, idx_sh_pitch_r] = torch.empty(len(env_ids), device=self.device).uniform_(-(p + 0.4), p + 0.4)
+        
+        # shoulder_roll_r: U(-(1.3*p + 0.15), -0.15)
+        if idx_sh_roll_r is not None and 0 <= idx_sh_roll_r < self.num_dof:
+            q_init[:, idx_sh_roll_r] = torch.empty(len(env_ids), device=self.device).uniform_(-(1.3 * p + 0.15), -0.15)
+        
+        # elbow_l: U(-0.1-0.3*p, 0.1+0.6*p)
+        if idx_elbow_l is not None and 0 <= idx_elbow_l < self.num_dof:
+            q_init[:, idx_elbow_l] = torch.empty(len(env_ids), device=self.device).uniform_(-0.1 - 0.3 * p, 0.1 + 0.6 * p)
+        
+        # elbow_r: U(-0.1-0.3*p, 0.1+0.6*p)
+        if idx_elbow_r is not None and 0 <= idx_elbow_r < self.num_dof:
+            q_init[:, idx_elbow_r] = torch.empty(len(env_ids), device=self.device).uniform_(-0.1 - 0.3 * p, 0.1 + 0.6 * p)
+        
+        # Update DOF positions
+        self.dof_pos[env_ids] = q_init
+        
+        # Update DOF state in simulation
+        env_ids_int32 = env_ids.to(dtype=torch.int32)
+        self.gym.set_dof_state_tensor_indexed(
+            self.sim,
+            gymtorch.unwrap_tensor(self.dof_state),
+            gymtorch.unwrap_tensor(env_ids_int32),
+            len(env_ids_int32)
+        )
+        
+        # 3) Modify initial root linear velocity (curriculum learning)
+        # vx, vy ~ U(-0.1-0.25*p, 0.1+0.25*p)
+        if not self.cfg.asset.fix_base_link:
+            # Calculate initial velocity
+            vx = torch.empty(len(env_ids), device=self.device).uniform_(-0.1 - 0.25 * p, 0.1 + 0.25 * p)
+            vy = torch.empty(len(env_ids), device=self.device).uniform_(-0.1 - 0.25 * p, 0.1 + 0.25 * p)
+            
+            # Set initial velocity
+            self.root_states[env_ids, 7] = vx  # lin_vel_x
+            self.root_states[env_ids, 8] = vy  # lin_vel_y
+            
+            # Update root state in simulation
+            self.gym.set_actor_root_state_tensor_indexed(
+                self.sim,
+                gymtorch.unwrap_tensor(self.root_states),
+                gymtorch.unwrap_tensor(env_ids_int32),
+                len(env_ids_int32)
+            )
     
     def check_termination(self):
         """Check if environments need to be reset"""
@@ -284,8 +492,10 @@ class Pm01Robot(LeggedRobot):
         elbow_hit = _hit(self.elbow_pitch_indices)
         
         # Check knee/hip flexion (relative to default angles)
-        p = 0.0  # Training progress (simplified for now)
-        knee_flex_threshold = 1.3 * min(1.0, p / 0.05)  # Additional flexion beyond default
+        # Use training progress p computed by compute_training_progress()
+        p = self.compute_training_progress().item()  # Get scalar value
+        
+        knee_flex_threshold = 1.3 * min(1.0, p / 0.2)  # Additional flexion beyond default
         knee_flex_ok = True
         if len(self.knee_dof_indices) > 0:
             knee_angles = self.dof_pos[:, self.knee_dof_indices]
@@ -294,7 +504,7 @@ class Pm01Robot(LeggedRobot):
             # Check if flexion relative to default exceeds threshold
             knee_flex_ok = ((knee_angles - default_knee_angles.unsqueeze(0)) > knee_flex_threshold).any(dim=1)
         
-        hip_flex_threshold = -1.0 * min(1.0, p / 0.05)  # Additional flexion beyond default (negative for hip)
+        hip_flex_threshold = -1.0 * min(1.0, p / 0.2)  # Additional flexion beyond default (negative for hip)
         hip_flex_ok = True
         if len(self.hip_pitch_dof_indices) > 0:
             hip_angles = self.dof_pos[:, self.hip_pitch_dof_indices]

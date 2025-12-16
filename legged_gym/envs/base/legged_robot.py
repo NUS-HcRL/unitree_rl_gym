@@ -149,6 +149,13 @@ class LeggedRobot(BaseTask):
         self.feet_air_time[env_ids] = 0.
         self.episode_length_buf[env_ids] = 0
         self.reset_buf[env_ids] = 1
+        
+        # Resample push parameters for reset environments (if force-based pushing is enabled)
+        if (self.cfg.domain_rand.push_robots and 
+            hasattr(self.cfg.domain_rand, 'max_push_force_xy') and 
+            hasattr(self.cfg.domain_rand, 'push_durations') and
+            hasattr(self, 'push_force')):
+            self._resample_push(env_ids)
         # fill extras
         self.extras["episode"] = {}
         for key in self.episode_sums.keys():
@@ -379,19 +386,151 @@ class LeggedRobot(BaseTask):
                                                      gymtorch.unwrap_tensor(env_ids_int32), len(env_ids_int32))
 
     def _push_robots(self):
-        """ Random pushes the robots. Emulates an impulse by setting a randomized base velocity. 
+        """ Random pushes the robots. Supports both velocity-based and force-based pushing.
         """
-        env_ids = torch.arange(self.num_envs, device=self.device)
-        push_env_ids = env_ids[self.episode_length_buf[env_ids] % int(self.cfg.domain_rand.push_interval) == 0]
-        if len(push_env_ids) == 0:
-            return
-        max_vel = self.cfg.domain_rand.max_push_vel_xy
-        self.root_states[:, 7:9] = torch_rand_float(-max_vel, max_vel, (self.num_envs, 2), device=self.device) # lin vel x/y
+        # Check if force-based pushing is enabled (has max_push_force_xy and push_durations, and force > 0)
+        if (hasattr(self.cfg.domain_rand, 'max_push_force_xy') and 
+            hasattr(self.cfg.domain_rand, 'push_durations') and
+            hasattr(self, 'push_force')):
+            # Check if force is non-zero
+            force_max = self.cfg.domain_rand.max_push_force_xy
+            if isinstance(force_max, (list, tuple)) and len(force_max) > 0:
+                force_max = force_max[-1]  # Use max value from range
+            if force_max > 0:
+                # Use force-based pushing (from aoqianz branch)
+                self._force_push()
+                return
         
-        env_ids_int32 = push_env_ids.to(dtype=torch.int32)
-        self.gym.set_actor_root_state_tensor_indexed(self.sim,
-                                                    gymtorch.unwrap_tensor(self.root_states),
-                                                    gymtorch.unwrap_tensor(env_ids_int32), len(env_ids_int32))
+        # Use velocity-based pushing (original implementation)
+        self._velocity_push()
+    
+    def _velocity_push(self):
+        """Apply velocity-based pushing to robots (from aoqianz branch implementation).
+        Emulates an impulse by setting a randomized base velocity.
+        """
+        # Skip if velocity push is disabled (max_push_vel_xy = 0)
+        max_vel = self.cfg.domain_rand.max_push_vel_xy
+        if max_vel <= 0:
+            return
+        
+        # Check if we should push at this step (based on push_interval)
+        if self.common_step_counter % int(self.cfg.domain_rand.push_interval) == 0:
+            # Sample random velocity push
+            rand_push_force_xy = torch_rand_float(
+                -max_vel, max_vel, (self.num_envs, 2), device=self.device
+            )  # lin vel x/y
+            
+            # Add angular velocity push if available
+            if hasattr(self.cfg.domain_rand, 'max_push_ang_vel'):
+                max_push_angular = self.cfg.domain_rand.max_push_ang_vel
+                if max_push_angular > 0:
+                    rand_push_torque = torch_rand_float(
+                        -max_push_angular, max_push_angular, (self.num_envs, 3), device=self.device
+                    )
+                else:
+                    rand_push_torque = torch.zeros((self.num_envs, 3), device=self.device)
+            else:
+                rand_push_torque = torch.zeros((self.num_envs, 3), device=self.device)
+            
+            # Apply velocity changes (additive, not replacement)
+            self.root_states[:, 7:9] += rand_push_force_xy
+            self.root_states[:, 10:13] += rand_push_torque
+            
+            # Update all environments
+            self.gym.set_actor_root_state_tensor(
+                self.sim, gymtorch.unwrap_tensor(self.root_states)
+            )
+    
+    def _force_push(self):
+        """Apply force-based pushing to robots (from aoqianz branch implementation)"""
+        # Check if force is enabled (non-zero)
+        force_max = self.cfg.domain_rand.max_push_force_xy
+        if isinstance(force_max, (list, tuple)) and len(force_max) > 0:
+            force_max = force_max[-1]  # Use max value from range
+        if force_max <= 0:
+            return  # Force push disabled
+        
+        self.rb_force_tensor.zero_()
+        self.rb_torque_tensor.zero_()
+        
+        # push_time and push_duration are stored in steps
+        lower_bound = self.push_time
+        upper_bound = lower_bound + self.push_duration
+        in_push_window = (self.episode_length_buf >= lower_bound) & (self.episode_length_buf < upper_bound)
+        
+        if in_push_window.any():
+            env_ids = torch.nonzero(in_push_window).squeeze(-1)
+            if len(env_ids.shape) == 0:
+                env_ids = env_ids.unsqueeze(0)
+            
+            # Find torso/base body index (use base link if torso not available)
+            if not hasattr(self, 'torso_index'):
+                # Try to find torso body, fallback to base link (index 0)
+                torso_body_name = getattr(self.cfg.asset, 'torso_name', None)
+                if torso_body_name and hasattr(self, 'body_names'):
+                    try:
+                        torso_idx = self.body_names.index(torso_body_name)
+                        self.torso_index = torso_idx
+                    except (ValueError, AttributeError):
+                        self.torso_index = 0  # Use base link
+                else:
+                    self.torso_index = 0  # Use base link
+            
+            # Apply force to torso/base body
+            self.rb_force_tensor[env_ids, self.torso_index, :] = self.push_force[env_ids, :]
+        
+        # Apply forces to simulation
+        self.gym.apply_rigid_body_force_tensors(
+            self.sim,
+            self.force_tensor,
+            self.torque_tensor,
+            gymapi.ENV_SPACE
+        )
+    
+    def _resample_push(self, env_ids):
+        """Resample push parameters for reset environments (from aoqianz branch implementation)"""
+        if len(env_ids) == 0:
+            return
+        
+        # Sample push time: use configured time window (default 20%-30% if not specified)
+        if hasattr(self.cfg.domain_rand, 'push_time_window'):
+            time_window_min = self.cfg.domain_rand.push_time_window[0]
+            time_window_max = self.cfg.domain_rand.push_time_window[1]
+        else:
+            time_window_min = 0.2  # Default: 20%
+            time_window_max = 0.3  # Default: 30%
+        min_t = int(time_window_min * self.max_episode_length)
+        max_t = int(time_window_max * self.max_episode_length)
+        self.push_time[env_ids] = torch.randint(
+            low=min_t,
+            high=max_t,
+            size=(len(env_ids),),
+            device=self.device
+        )
+        
+        # Sample push duration from configured range
+        dur_min = self.cfg.domain_rand.push_durations[0]
+        dur_max = self.cfg.domain_rand.push_durations[1]
+        low_steps = int(dur_min / self.dt)
+        high_steps = int(dur_max / self.dt) + 1
+        self.push_duration[env_ids] = torch.randint(
+            low=low_steps,
+            high=high_steps,
+            size=(len(env_ids),),
+            device=self.device
+        )
+        
+        # Sample force direction and magnitude
+        rand_xy = torch.randn((len(env_ids), 2), device=self.device)
+        rand_xy = rand_xy / torch.norm(rand_xy, dim=-1, keepdim=True).clamp(min=1e-8)
+        
+        force_min = self.cfg.domain_rand.max_push_force_xy[0]
+        force_max = self.cfg.domain_rand.max_push_force_xy[1]
+        force_magnitude = torch.rand(len(env_ids), device=self.device) * (force_max - force_min) + force_min
+        force_xy = rand_xy * force_magnitude.unsqueeze(-1)
+        
+        self.push_force[env_ids, :2] = force_xy
+        self.push_force[env_ids, 2] = 0.0  # No vertical force
 
    
     
@@ -457,6 +596,19 @@ class LeggedRobot(BaseTask):
         self.common_step_counter = 0
         self.extras = {}
         self.noise_scale_vec = self._get_noise_scale_vec(self.cfg)
+        
+        # Initialize push disturbance buffers (for force-based pushing)
+        if self.cfg.domain_rand.push_robots:
+            # Check if force-based push parameters are available
+            if hasattr(self.cfg.domain_rand, 'max_push_force_xy') and hasattr(self.cfg.domain_rand, 'push_durations'):
+                self.push_time = torch.full((self.num_envs,), -1, dtype=torch.long, device=self.device)  # in steps
+                self.push_duration = torch.full((self.num_envs,), -1, dtype=torch.long, device=self.device)  # in steps
+                self.push_force = torch.zeros((self.num_envs, 3), device=self.device)
+                self.rb_force_tensor = torch.zeros((self.num_envs, self.num_bodies, 3), device=self.device)
+                self.rb_torque_tensor = torch.zeros_like(self.rb_force_tensor)
+                self.force_tensor = gymtorch.unwrap_tensor(self.rb_force_tensor)
+                self.torque_tensor = gymtorch.unwrap_tensor(self.rb_torque_tensor)
+                # Note: resample_push will be called after max_episode_length is set in _parse_cfg
         self.gravity_vec = to_torch(get_axis_params(-1., self.up_axis_idx), device=self.device).repeat((self.num_envs, 1))
         self.forward_vec = to_torch([1., 0., 0.], device=self.device).repeat((self.num_envs, 1))
         self.torques = torch.zeros(self.num_envs, self.num_actions, dtype=torch.float, device=self.device, requires_grad=False)
@@ -643,6 +795,14 @@ class LeggedRobot(BaseTask):
         self.max_episode_length = np.ceil(self.max_episode_length_s / self.dt)
 
         self.cfg.domain_rand.push_interval = np.ceil(self.cfg.domain_rand.push_interval_s / self.dt)
+        
+        # Initialize push parameters for all environments (if force-based pushing is enabled)
+        if (self.cfg.domain_rand.push_robots and 
+            hasattr(self.cfg.domain_rand, 'max_push_force_xy') and 
+            hasattr(self.cfg.domain_rand, 'push_durations') and
+            hasattr(self, 'push_force')):
+            env_ids = torch.arange(self.num_envs, device=self.device)
+            self._resample_push(env_ids)
 
 
     #------------ reward functions----------------

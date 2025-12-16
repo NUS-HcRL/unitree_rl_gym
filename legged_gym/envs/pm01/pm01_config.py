@@ -36,7 +36,7 @@ class Pm01FallCfg(LeggedRobotCfg):
         num_observations = 82
         num_privileged_obs = 82  # Same as observations for now
         num_actions = 22  # 22 controllable joints (excluding j12_waist_yaw and j23_head_yaw)
-        env_spacing = 1.5
+        env_spacing = 3.0  # Increased from 1.5 to 3.0 for larger spacing between robots
         episode_length_s = 3
         send_timeouts = True
 
@@ -107,9 +107,20 @@ class Pm01FallCfg(LeggedRobotCfg):
         friction_range = [0.2, 1.3]
         randomize_base_mass = False
         added_mass_range = [-4.0, 4.0]
-        push_robots = False
-        push_interval_s = 8
-        max_push_vel_xy = 0.4
+        push_robots = True  # Enable push disturbance (from aoqianz branch)
+        push_interval_s = 0  # if episode_length is times larger than push_interval_s, then set it to 8.
+        max_push_vel_xy = 0.0  # Set to 0 to disable velocity push, only use force push
+        max_push_ang_vel = 0.0  # Set to 0 to disable angular velocity push
+        max_push_force_xy = [800, 1200]  # Force push range [min, max] in N (from aoqianz branch)
+        push_durations = [2.0, 3.0]  # Push duration range [min, max] in seconds (from aoqianz branch)
+        push_time_window = [0.0, 0.1]  # Push time window as fraction of episode [min, max] (0.0-1.0). For fall task, push early (0%-10%)
+        
+        class curriculum:
+            # 启用课程学习（根据表格2）
+            enable_curriculum = True  # 开启课程学习
+            # 最大训练步数：可根据实际训练情况调整
+            # 例如：15000 迭代 * 4096 环境 * 24 步/迭代 = 1,474,560,000 步
+            max_curriculum_step = 15000 * 4096 * 24
 
     class commands(LeggedRobotCfg.commands):
         curriculum = False
@@ -148,7 +159,7 @@ class Pm01FallCfg(LeggedRobotCfg):
             # Fall protection rewards
             root_lin_vel = -0.0
             critical_contacts = -0.0
-            all_contacts = -1.0e-3
+            all_contacts = -1.0e-6
             actuation_impulse = -0.0
             dof_pos_limits = -0.0
             torque_saturation = -0.0
